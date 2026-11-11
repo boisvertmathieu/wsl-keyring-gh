@@ -14,7 +14,127 @@ wsl --update
 wsl --list --verbose
 ```
 
-Dans Ubuntu, vérifiez `cat /etc/os-release` et `id -un`. **systemd est recommandé, pas requis** : il fournit un bus utilisateur partagé entre les terminaux. Pour l’activer, conservez les autres réglages de `/etc/wsl.conf` et ajoutez ou adaptez :
+Dans Ubuntu, vérifiez `cat /etc/os-release` et `id -un`. **systemd n’est pas requis**. Le cas de référence testé est un bus privé `dbus-run-session`, sans systemd. La voie systemd ci-dessous reste **non testée** ; ne mélangez pas les deux branches.
+
+## 2. Installer la pile principale
+
+**GNOME Keyring + libsecret + D-Bus** expose le service de secrets Linux utilisé par `gh`, sans intégration GPG supplémentaire ni jeton enregistré en clair. `pass` seul n’expose pas ce service.
+
+```bash
+sudo apt update
+apt-cache policy gnome-keyring libsecret-tools dbus dbus-user-session gh
+sudo apt install --no-install-recommends gnome-keyring libsecret-tools dbus dbus-user-session gh ca-certificates procps
+```
+
+Ces noms correspondent à Ubuntu 26.04 : [`gnome-keyring`](https://packages.ubuntu.com/resolute/gnome-keyring) fournit le daemon, [`libsecret-tools`](https://packages.ubuntu.com/resolute/libsecret-tools) fournit `secret-tool` et tire la bibliothèque libsecret. `dbus` fournit notamment `dbus-run-session` ; `dbus-user-session` intègre le bus à la session utilisateur. `procps` fournit `pgrep` et `pkill` pour détecter et arrêter les daemons. Le paquet [`gh`](https://packages.ubuntu.com/resolute/gh) de la distribution est dans `universe` et évite un dépôt et une clé de signature supplémentaires. Il peut être plus ancien que les paquets officiels GitHub : lors des tests sous Ubuntu 26.04.1 LTS, sa version était `2.46.0-4`. L’aide de cette version confirme le coffre système par défaut, le repli en clair si le coffre est absent ou inutilisable et la présence de `--insecure-storage`. Contrôlez votre installation avec `gh --version` et `gh auth login --help`.
+
+Si un paquet n’a aucun candidat, vérifiez les sources Ubuntu 26.04 et l’activation de `universe` (notamment pour `gh` et `libsecret-tools`). Au besoin :
+
+```bash
+sudo apt install software-properties-common
+sudo add-apt-repository universe
+sudo apt update
+apt-cache search '^libsecret-tools$|^gnome-keyring$|^dbus-user-session$|^gh$'
+```
+
+## 3. Ouvrir une session et gérer le coffre
+
+D-Bus transporte les requêtes entre `gh`, `secret-tool` et le service `org.freedesktop.secrets`. Les programmes doivent partager le même **bus de session**. Sans affichage, le prompteur GNOME peut échouer avec `cannot open display` : le premier déverrouillage doit se faire en ligne de commande.
+
+### 3.1 Sans systemd : bus privé (cas de référence)
+
+Retirez de `~/.bashrc` les anciens exports systemd si vous suivez cette branche. N’exportez pas `XDG_RUNTIME_DIR=/run/user/…` ici. Préparez un répertoire privé accessible, puis ouvrez le shell dédié :
+
+```bash
+install -d -m 700 "$HOME/.cache"
+export XDG_RUNTIME_DIR="$(mktemp -d "$HOME/.cache/keyring-session.XXXXXX")"
+dbus-run-session -- bash
+```
+
+Dans ce nouveau shell, définissez les fonctions suivantes. Vous pouvez les conserver dans `~/.bashrc` : ouvrez `touch ~/.bashrc && nano ~/.bashrc`, ajoutez ce bloc, enregistrez et quittez, puis exécutez `source ~/.bashrc`. `nano` peut être installé avec `sudo apt install nano` si nécessaire (également pour éditer `/etc/wsl.conf` plus bas). Ces définitions ne lancent aucun daemon à l’ouverture d’un terminal.
+
+```bash
+coffre_pids() {
+    # Nom Linux limité à 15 caractères ; exclure les processus zombies.
+    pgrep -u "$(id -u)" -x -r RSDTt gnome-keyring-d
+}
+
+coffre_demarrer() {
+    if coffre_pids >/dev/null; then
+        echo 'Daemon déjà présent : aucun lancement (état du coffre à vérifier).' >&2
+        return 0
+    fi
+    timeout 20s gnome-keyring-daemon --unlock --components=secrets
+}
+
+coffre_arreter() {
+    local tentative
+    if coffre_pids >/dev/null; then
+        pkill -TERM -u "$(id -u)" -x -r RSDTt gnome-keyring-d || return 1
+    fi
+    for ((tentative=0; tentative<50; tentative++)); do
+        if ! coffre_pids >/dev/null; then
+            unset GNOME_KEYRING_CONTROL
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo 'ÉCHEC : daemon encore actif après 5 secondes.' >&2
+    return 1
+}
+```
+
+Cette procédure suppose **un seul bus et aucun lancement concurrent pour cet utilisateur**. La détection par utilisateur est volontairement prudente : un daemon sur un autre bus empêche aussi un nouveau lancement. Le nom court et le filtre d’états sont décrits dans le [manuel de `pgrep`](https://manpages.ubuntu.com/manpages/resolute/man1/pgrep.1.html) ; un zombie n’est plus un daemon actif.
+
+Pour le premier démarrage, utilisez :
+
+```bash
+read -r -s -p 'Mot de passe du coffre login : ' keyring_password; printf '\n'
+printf %s "$keyring_password" | coffre_demarrer
+unset keyring_password
+```
+
+Choisissez un mot de passe non vide. Le premier `--unlock` crée `login` s’il n’existe pas. `printf %s` évite d’ajouter un saut de ligne au mot de passe. Le mot de passe du coffre peut différer du mot de passe Linux ; ne le stockez pas dans `.bashrc` ou un fichier.
+
+**Ne répétez pas directement `gnome-keyring-daemon --unlock`** : sous GNOME Keyring 50.0-1 sans systemd, deux appels peuvent créer deux daemons, même avec deux codes de sortie 0. `coffre_demarrer` détecte un daemon actif et saute le second lancement ; ce saut **ne prouve pas que le coffre est déverrouillé**. Le test réel B1 sous `ubuntu:26.04`, sans systemd, a confirmé qu’après deux appels de cette procédure, un seul daemon reste actif, avec le même PID et un lookup identique.
+
+Ne lancez pas `--start` avant `--unlock`, ni les deux ensemble. `--start` sert surtout à terminer une initialisation déjà commencée (par exemple via PAM `--login`) ; il n’est pas nécessaire au premier `store` / `lookup` testé ici. Voir les [options du daemon](https://manpages.ubuntu.com/manpages/resolute/man1/gnome-keyring-daemon.1.html).
+
+Gardez `gh` et `secret-tool` dans ce shell. Chaque `dbus-run-session` crée un autre bus ; ne multipliez pas ces sessions pour le même utilisateur. En fin d’utilisation, après avoir fermé les applications qui utilisent le coffre :
+
+```bash
+coffre_arreter
+exit
+```
+
+De retour dans le shell parent, `rmdir "$XDG_RUNTIME_DIR"` enlève le répertoire s’il est vide ; sinon, conservez-le pour examen. N’utilisez pas de suppression récursive sur une variable de session.
+
+### 3.2 Coffre déjà verrouillé : reprise testée par B2
+
+Le QA a montré qu’un nouveau `--unlock` sur un daemon existant pouvait retourner 0 tout en laissant `Locked=true`. N’en faites pas une commande de réouverture fiable.
+
+La procédure validée par le test réel B2 sous `ubuntu:26.04`, sans systemd, consiste à arrêter le daemon puis à le relancer avec `coffre_demarrer` dans **le même bus**, sans toucher aux fichiers du coffre. Fermez d’abord les applications qui utilisent le coffre. Dans le shell de la section 3.1, avec ses fonctions déjà définies :
+
+```bash
+if coffre_arreter; then
+    read -r -s -p 'Mot de passe du coffre login : ' keyring_password; printf '\n'
+    printf %s "$keyring_password" | coffre_demarrer
+    unset keyring_password
+fi
+```
+
+Refaites ensuite le diagnostic `store` / `lookup` de la section 4. Ce redémarrage touche tous les daemons de coffre de cet utilisateur ; il est destiné à la session privée décrite ici. **Cette reprise a été validée dans le conteneur `ubuntu:26.04`, sans systemd** : le test B2 a constaté `Locked=true` après verrouillage, puis `Locked=false` et la restitution de la valeur stockée après cette séquence, sans redémarrer le bus ni changer de HOME. Ne considérez pas le seul code 0 du daemon comme une preuve. Si la reprise échoue, le redémarrage complet de la session reste l’issue observée par le QA : arrêtez le daemon, quittez le shell privé et reprenez la section 3.1 avec le même mot de passe et les mêmes fichiers de coffre.
+
+### 3.3 Avec systemd : voie non testée
+
+Cette voie n’est pas validée par le test en conteneur. Si vous souhaitez l’essayer, ne lancez pas aussi la branche `dbus-run-session`. Pour activer systemd, ouvrez le fichier avec les droits administrateur :
+
+```bash
+sudo touch /etc/wsl.conf
+sudo nano /etc/wsl.conf
+```
+
+Conservez les autres sections et ajoutez ou adaptez exactement cette entrée (sans dupliquer une section `[boot]` existante) :
 
 ```ini
 [boot]
@@ -30,76 +150,20 @@ systemctl --user is-system-running
 systemctl --user status dbus.socket
 ```
 
-PID 1 doit être `systemd`. Un état utilisateur `degraded` demande d’examiner les unités en échec ; « Failed to connect to bus » signifie que le gestionnaire ou son bus utilisateur n’est pas accessible. Voir la [documentation WSL de Microsoft](https://learn.microsoft.com/en-us/windows/wsl/systemd).
+PID 1 doit être `systemd` et le bus utilisateur doit être accessible. Un état `degraded` demande d’examiner les unités en échec ; « Failed to connect to bus » indique un problème de session utilisateur. Voir la [documentation WSL de Microsoft](https://learn.microsoft.com/en-us/windows/wsl/systemd).
 
-## 2. Installer la pile principale
-
-**GNOME Keyring + libsecret + D-Bus** expose le service de secrets Linux utilisé par `gh`, sans intégration GPG supplémentaire ni jeton enregistré en clair. `pass` seul n’expose pas ce service.
-
-```bash
-sudo apt update
-apt-cache policy gnome-keyring libsecret-tools dbus dbus-user-session gh
-sudo apt install --no-install-recommends gnome-keyring libsecret-tools dbus dbus-user-session gh ca-certificates
-```
-
-Ces noms correspondent à Ubuntu 26.04 : [`gnome-keyring`](https://packages.ubuntu.com/resolute/gnome-keyring) fournit le daemon, [`libsecret-tools`](https://packages.ubuntu.com/resolute/libsecret-tools) fournit `secret-tool` et tire la bibliothèque libsecret. `dbus` fournit notamment `dbus-run-session` ; `dbus-user-session` intègre le bus à la session utilisateur. Le paquet [`gh`](https://packages.ubuntu.com/resolute/gh) de la distribution est dans `universe` et évite un dépôt et une clé de signature supplémentaires. Il peut être plus ancien que les paquets officiels GitHub : lors des tests sous Ubuntu 26.04.1 LTS, sa version était `2.46.0-4`. L’aide de cette version confirme le coffre système par défaut, le repli en clair si le coffre est absent ou inutilisable et la présence de `--insecure-storage`. Contrôlez votre installation avec `gh --version` et `gh auth login --help`.
-
-Si un paquet n’a aucun candidat, vérifiez les sources Ubuntu 26.04 et l’activation de `universe` (notamment pour `gh` et `libsecret-tools`). Au besoin :
-
-```bash
-sudo apt install software-properties-common
-sudo add-apt-repository universe
-sudo apt update
-apt-cache search '^libsecret-tools$|^gnome-keyring$|^dbus-user-session$|^gh$'
-```
-
-## 3. Ouvrir une session et déverrouiller le coffre
-
-D-Bus transporte les requêtes entre `gh`, `secret-tool` et le service `org.freedesktop.secrets`. Installer les paquets ne suffit pas : les programmes doivent partager le même **bus de session**, et le coffre `login` doit être déverrouillé.
-
-Avec systemd, si le bus existe mais que la variable manque :
-
-```bash
-export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-test -S "$XDG_RUNTIME_DIR/bus" && export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
-```
-
-Sans systemd ou sans bus utilisateur fonctionnel, ouvrez un shell dédié :
-
-```bash
-dbus-run-session -- bash
-```
-
-Effectuez les étapes suivantes et utilisez `gh` **dans ce shell**. `exit` termine cette session ; chaque shell lancé ainsi a son propre bus. Évitez plusieurs bus et daemons concurrents sur le même coffre.
-
-Dans la session choisie, saisissez le mot de passe du coffre sans l’afficher ni l’inscrire dans l’historique. `--unlock` déverrouille le coffre et démarre le daemon s’il n’existe pas encore ; ne le faites pas précéder de `--start` :
-
-```bash
-read -r -s -p 'Mot de passe du coffre login : ' keyring_password; printf '\n'
-printf %s "$keyring_password" | gnome-keyring-daemon --unlock --components=secrets
-unset keyring_password
-```
-
-Choisissez un mot de passe non vide. Au premier `--unlock`, le coffre `login` est créé s’il n’existe pas ; ensuite, utilisez son mot de passe existant. Il peut différer du mot de passe Linux. La commande lit l’entrée standard : `printf %s` évite d’ajouter un saut de ligne au mot de passe. Voir les [options du daemon](https://manpages.ubuntu.com/manpages/resolute/man1/gnome-keyring-daemon.1.html).
-
-Avec GNOME Keyring 50.0-1 sous Ubuntu 26.04, lancer `--start` avant `--unlock` peut laisser un premier daemon verrouillé propriétaire de Secret Service tandis que `--unlock` en démarre un second. `secret-tool` contacte alors le premier et échoue. `--start` sert surtout à terminer l’initialisation d’un daemon déjà lancé, souvent par PAM avec `--login` (qui implique `--unlock`). Si nécessaire, il vient **après** un `--unlock` réussi ; ne combinez pas les deux options. Il n’est pas nécessaire pour `secret-tool` ou `gh` lorsque le déverrouillage a réussi et que le bus de session est le bon.
-
-### Au démarrage des terminaux
-
-Avec systemd, cet extrait peut être ajouté à `~/.bashrc` pour raccorder les terminaux interactifs au bus partagé, sans démarrer de daemon avant le premier déverrouillage :
+Pour raccorder les terminaux au socket utilisateur, ouvrez `touch ~/.bashrc && nano ~/.bashrc` et ajoutez **seulement dans cette branche** :
 
 ```bash
 if [[ $- == *i* ]]; then
-    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-    if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+    if [ -S "/run/user/$(id -u)/bus" ]; then
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
         export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
     fi
 fi
 ```
 
-Après le démarrage de WSL, exécutez les trois lignes `read` / `printf … --unlock` / `unset` ci-dessus dans un premier terminal. Les autres terminaux utilisant ce bus profitent du coffre ouvert ; ils n’ont pas besoin de `GNOME_KEYRING_CONTROL` pour utiliser `secret-tool` ou `gh`. Il faut normalement saisir le mot de passe une fois par session de coffre, et de nouveau après verrouillage ou redémarrage. Sans systemd, utilisez le shell `dbus-run-session` et déverrouillez-y le coffre.
-
-WSL ne passe pas toujours par PAM ou un login graphique qui transmettrait le mot de passe Linux au coffre. Le raccordement au bus **ne déverrouille pas silencieusement le coffre**. Sans interface graphique, le prompteur GNOME peut être indisponible (`cannot open display`) : déverrouillez en ligne de commande avant d’utiliser le service de secrets. Ne placez pas son mot de passe dans `.bashrc`, un service ou un fichier.
+Enregistrez, quittez puis exécutez `source ~/.bashrc`. Ce bloc ne lance ni ne déverrouille le coffre. Un service utilisateur ou PAM peut déjà avoir démarré un daemon : ne lui appliquez pas aveuglément la procédure d’arrêt de la branche privée. Le partage entre terminaux, l’activation systemd et le déverrouillage dans cette voie restent à tester. WSL ne fournit pas toujours le login PAM ou graphique qui transmettrait le mot de passe au coffre ; aucune ouverture silencieuse n’est garantie.
 
 ## 4. Vérifier le coffre avant de connecter `gh`
 
@@ -111,7 +175,7 @@ secret-tool lookup application diagnostic-wsl purpose smoke
 secret-tool clear application diagnostic-wsl purpose smoke
 ```
 
-Le `lookup` doit rendre `valeur-publique-de-test`. Ces attributs sont ceux de notre test, pas ceux de `gh`. Un blocage ou une fenêtre de déverrouillage indique souvent un coffre fermé ; interrompez et déverrouillez-le dans le même bus.
+Le `lookup` doit rendre `valeur-publique-de-test`. Ces attributs sont ceux de notre test, pas ceux de `gh`. Un blocage ou une fenêtre de déverrouillage indique souvent un coffre fermé ; interrompez et consultez la reprise de la section 3.2, sans répéter directement `--unlock`.
 
 ## 5. Connecter GitHub CLI et contrôler le stockage
 
@@ -158,11 +222,11 @@ Remplacez `VOTRE_IDENTIFIANT` par le compte concerné. La déconnexion supprime 
 
 ## 6. Dépannage courant
 
-- **Bus absent / `Cannot autolaunch D-Bus` / `Failed to connect to bus`** : vérifiez `printenv DBUS_SESSION_BUS_ADDRESS` et `systemctl --user status dbus.socket`. Raccordez-vous au socket utilisateur comme indiqué plus haut. Sans ce socket, utilisez `dbus-run-session -- bash`, puis recommencez dans ce shell. Une variable définie peut aussi pointer vers un bus disparu.
-- **Daemon absent ou coffre `login` verrouillé** : utilisez directement la saisie masquée et `--unlock` de la section 3, sans `--start` préalable. Si un daemon verrouillé a déjà été lancé avant le déverrouillage, arrêtez d’abord les applications utilisant le coffre, puis ce daemon et son éventuelle unité utilisateur avant de reprendre avec `--unlock`. Dans le cas d’un shell `dbus-run-session`, quittez cette session et ouvrez-en une nouvelle après avoir arrêté son daemon. Ne supprimez pas les fichiers du coffre. `cannot open display` ou `Object does not exist at path …/collection/login` peuvent être les symptômes de cette mauvaise séquence. Un code de sortie du daemon ne prouve pas à lui seul le déverrouillage : refaites `store` / `lookup`. N’utilisez pas un mot de passe vide pour contourner l’erreur.
+- **Bus absent / `Cannot autolaunch D-Bus` / `Failed to connect to bus`** : vérifiez `printenv DBUS_SESSION_BUS_ADDRESS`. Sans systemd, reprenez la section 3.1 avec son répertoire privé. Dans la branche systemd uniquement, examinez `systemctl --user status dbus.socket` et le socket utilisateur. Une variable définie peut pointer vers un bus disparu ; ne mélangez pas les exports des deux branches.
+- **Daemon absent ou coffre `login` verrouillé** : utilisez `coffre_demarrer` pour le premier lancement. S’il existe déjà un daemon, ne supposez pas que `--unlock` le réutilise ou rouvre le coffre. La reprise décrite en section 3.2 a été validée par B2 dans le conteneur sans systemd : arrêt du daemon, puis `coffre_demarrer` sur le même bus. `cannot open display` ou `Object does not exist at path …/collection/login` peuvent signaler un coffre fermé. Ne supprimez pas ses fichiers et ne contournez pas l’erreur par un mot de passe vide.
 - **`gh` écrit encore en clair** : confirmez que `secret-tool` fonctionne depuis exactement le même terminal, sans `sudo`. Contrôlez les variables de jeton, `GH_CONFIG_DIR`, les permissions du HOME et la version de `gh`. Retirez `--insecure-storage`, puis migrez les identifiants : installer les paquets ne déplace pas un jeton déjà enregistré.
-- **WSL sans systemd** : le shell `dbus-run-session` fonctionne sans gestionnaire systemd ; gardez-y le daemon et `gh`. Si vous voulez partager le bus entre terminaux, privilégiez l’activation de systemd plutôt que de fabriquer des adresses D-Bus persistantes.
-- **Mot de passe oublié ou coffre recréé** : si vous connaissez l’ancien mot de passe, changez-le avec Seahorse (outil graphique facultatif, paquet `seahorse`). Sans ce mot de passe, les secrets chiffrés ne sont pas récupérables. Arrêtez les processus utilisant le coffre et le daemon (y compris son unité utilisateur si active), sauvegardez le répertoire `~/.local/share/keyrings` en lieu sûr, puis écartez uniquement le coffre concerné, généralement `login.keyring`. Ne supprimez pas tout le répertoire par réflexe. Recréez `login` avec `--unlock`, puis reconnectez les applications dont les secrets étaient dans ce coffre. Un changement de mot de passe Linux ne change pas nécessairement celui du coffre sous WSL.
+- **WSL sans systemd** : le shell `dbus-run-session` fonctionne sans gestionnaire systemd ; gardez-y le daemon et `gh`. Ne mélangez pas les exports de la branche systemd avec ce bus privé. La voie systemd de la section 3.3 reste non testée.
+- **Mot de passe oublié ou coffre recréé** : si vous connaissez l’ancien mot de passe, changez-le avec Seahorse (outil graphique facultatif, paquet `seahorse`). Sans ce mot de passe, les secrets chiffrés ne sont pas récupérables. Arrêtez les processus utilisant le coffre et le daemon (y compris son unité utilisateur si active), sauvegardez le répertoire `~/.local/share/keyrings` en lieu sûr, puis écartez uniquement le coffre concerné, généralement `login.keyring`. Ne supprimez pas tout le répertoire par réflexe. Recréez `login` via le premier lancement de la section 3.1, puis reconnectez les applications dont les secrets étaient dans ce coffre. Un changement de mot de passe Linux ne change pas nécessairement celui du coffre sous WSL.
 
 ## 7. Alternatives brèves
 
@@ -178,8 +242,10 @@ Depuis la racine du dépôt, avec Docker (ou remplacez `docker` par `podman`) :
 docker run --rm -v "$PWD:/src:ro" ubuntu:26.04 bash /src/test/run.sh
 ```
 
-Le conteneur est jetable, le dépôt monté en lecture seule. Le script installe les paquets via APT, crée un utilisateur non-root et un HOME temporaire, démarre un bus privé, puis crée et déverrouille un coffre avec le mot de passe **public de test** `mot-de-passe-public-de-test`. Il compare exactement le résultat de `secret-tool store` / `lookup` avant de tenter `gh auth login` avec la chaîne fictive `fake`. Aucun HOME de l’hôte n’est monté, aucun vrai jeton n’est utilisé.
+Le conteneur est jetable, le dépôt monté en lecture seule. Le script installe les paquets via APT, crée un utilisateur non-root et un HOME temporaire, démarre un bus privé, puis crée et déverrouille un coffre avec le mot de passe **public de test** `mot-de-passe-public-de-test`. Il compare exactement le résultat de `secret-tool store` / `lookup`, teste B1 (deux appels de `coffre_demarrer`, même PID et un seul daemon actif), puis B2 (verrouillage D-Bus, `Locked=true`, `coffre_arreter` puis `coffre_demarrer` sur le même bus, `Locked=false` et lookup identique) avant de tenter `gh auth login` avec la chaîne fictive `fake`. Aucun HOME de l’hôte n’est monté, aucun vrai jeton n’est utilisé.
 
-Le résumé distingue le coffre et `gh`. Un refus du faux jeton, une erreur réseau ou un délai dépassé est attendu : cela ne valide pas le stockage de `gh`, mais n’annule pas le test du coffre. Le code de sortie est non nul si la préparation nécessaire au test ou la partie keyring/`secret-tool` échoue ; un échec de `gh` seul laisse le code à zéro. Les délais bornent les appels susceptibles de bloquer. APT nécessite le réseau ; ce test ne simule ni le démarrage réel de WSL ni PAM, et ne valide aucune authentification réelle GitHub.
+Le résumé distingue le premier accès au coffre, B1, B2 et `gh`. Le test installe aussi `procps` pour compter les daemons et `libglib2.0-bin` pour les appels D-Bus avec `gdbus`. Un refus du faux jeton, une erreur réseau ou un délai dépassé est attendu : cela ne valide pas le stockage de `gh`, mais n’annule pas le test du coffre. Le code de sortie est non nul si la préparation nécessaire au test ou la partie keyring/`secret-tool` (y compris B1 ou B2) échoue ; un échec de `gh` seul laisse le code à zéro. Les délais bornent les appels susceptibles de bloquer. APT nécessite le réseau ; ce test ne simule ni le démarrage réel de WSL ni PAM, et ne valide aucune authentification réelle GitHub.
 
-Lors du test fourni sous `ubuntu:26.04` (Ubuntu 26.04.1 LTS, GNOME Keyring 50.0-1, `gh` 2.46.0-4), le déverrouillage et la comparaison `store` / `lookup` ont réussi. GitHub a refusé `fake` avec `HTTP 401: Bad credentials` ; le script a terminé avec le code 0 conformément à son contrat. **Le stockage réel de `gh` dans le coffre n’a pas été prouvé.** Ce résultat en conteneur ne valide pas le démarrage sur une installation WSL réelle, son bus utilisateur systemd, l’intégration PAM ou un prompteur graphique.
+Lors de l’exécution réelle de la commande Docker ci-dessus sous `ubuntu:26.04` (Ubuntu 26.04.1 LTS, GNOME Keyring 50.0-1, `gh` 2.46.0-4), le premier déverrouillage (`Locked=false`), la comparaison `store` / `lookup` et les régressions B1 et B2 ont réussi. B1 a confirmé un seul daemon actif avec le même PID après deux appels ; B2 a confirmé la transition `Locked=true` puis `Locked=false` et la conservation de la valeur après arrêt et relance du daemon sur le même bus. GitHub a refusé `fake` avec `HTTP 401: Bad credentials` ; le script a terminé avec le code 0 conformément à son contrat. **Le stockage réel de `gh` dans le coffre n’a pas été prouvé.** Ce résultat en conteneur ne valide pas le démarrage sur une installation WSL réelle, son bus utilisateur systemd, l’intégration PAM ou un prompteur graphique.
+
+La voie systemd reste non testée. La réussite de B1/B2 porte sur le bus privé sans systemd du conteneur ; elle ne prouve pas le fonctionnement dans les autres environnements mentionnés ci-dessus.
